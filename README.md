@@ -12,12 +12,10 @@ https://github.com/seritools/owowon/assets/5844066/8ce4500a-6455-44d2-8d2e-5c12d
 
 https://github.com/seritools/owowon/assets/5844066/39abd056-9cb6-4d76-b3cf-fb16e1796c3d
 
-## Windows only
+## Cross-Platform Support
 
-I mostly created this for myself, putting on the reverse engineering hat to figure out how to talk
-to the device, giving egui a spin UI-wise, and checking out the WinUSB support of the Windows
-Runtime. The USB communication is thus tied to Windows right now, but should be able to be ported
-without too much hassle. The rest of the program is platform agnostic, to the extent that egui is.
+This program supports **Linux, macOS, and Windows**. The USB communication uses the cross-platform
+`nusb` library, providing native support on all three operating systems.
 
 ## Supported devices
 
@@ -28,11 +26,29 @@ pull requests if you like to expand the support.
 
 ## Installation
 
-The official Owon software uses `libusb` as driver, but since I wanted to give WinRT/WinUSB a spin,
-I "converted" it into a WinUSB device using [Zadig](https://zadig.akeo.ie/). The corresponding
-driver is provided in the `winusb driver` folder in this repository, but you can [generate your
-own](docs/zadig.png) through that tool if you like. You'll need it for the program to detect the
-oscilloscope.
+### Windows
+
+The official Owon software uses `libusb` as driver. For this program, you need to install the
+WinUSB driver using [Zadig](https://zadig.akeo.ie/). The corresponding driver is provided in the
+`winusb driver` folder in this repository, or you can [generate your own](docs/zadig.png) through
+that tool. You'll need this driver for the program to detect the oscilloscope.
+
+### Linux
+
+On Linux, USB permissions require a one-time udev rule installation:
+
+```bash
+sudo cp 50-owon-hds.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Then unplug and replug the device (or reboot). After this setup, the application runs as a regular
+user with no root permissions required.
+
+### macOS
+
+No driver installation required! macOS includes built-in USB support. You may see a security dialog
+on first access - click "Allow" to grant permission.
 
 ## Features
 

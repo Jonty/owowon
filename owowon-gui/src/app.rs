@@ -15,6 +15,7 @@ use egui::{
     vec2, Align, Color32, Context, Direction, FontFamily, FontId, Label, Layout, RichText,
     ScrollArea, TextStyle, Ui,
 };
+use nusb::DeviceInfo;
 use owowon::{
     data::{
         awg::{AwgConfig, AWG_MODES},
@@ -24,9 +25,12 @@ use owowon::{
     device::Device,
     InitialDeviceRunConfig, OscilloscopeMessage, OscilloscopeRunCommand,
 };
-use std::{collections::HashMap, fmt::Write, sync::Arc, time::Duration};
-use tokio::sync::RwLock;
-use windows::{core::HSTRING, Devices::Enumeration::DeviceInformation};
+use std::{
+    collections::HashMap,
+    fmt::Write,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 mod cmds;
 mod plot;
@@ -123,11 +127,7 @@ impl OwowonApp {
 
         let device_selector = DeviceSelector::new(move || egui_ctx.request_repaint()).ok();
 
-        let selected_device_id: Option<HSTRING> = app
-            .persistent_state
-            .selected_device
-            .as_ref()
-            .map(Into::into);
+        let selected_device_id: Option<String> = app.persistent_state.selected_device.clone();
 
         let mut app = OwowonApp {
             device_selector,
@@ -183,20 +183,19 @@ impl eframe::App for OwowonApp {
                 }
                 ui.heading("Select device");
                 ui.group(|ui| {
-                    let devices = device_list.blocking_read();
+                    let devices = device_list.read().unwrap();
                     if devices.is_empty() {
                         ui.label("No devices found");
                         return;
                     }
 
-                    for device in device_list.blocking_read().values() {
-                        let device_id = device.Id().unwrap();
+                    for (device_id, _device) in devices.iter() {
                         if ui
-                            .add(SelectableLabelFullWidth::new(false, device_id.to_string()))
+                            .add(SelectableLabelFullWidth::new(false, device_id.clone()))
                             .clicked()
                         {
-                            self.persistent_state.selected_device = Some(device_id.to_string());
-                            self.try_select_device(device_id, ctx);
+                            self.persistent_state.selected_device = Some(device_id.clone());
+                            self.try_select_device(device_id.clone(), ctx);
                         }
                     }
                 });
@@ -315,7 +314,7 @@ impl OwowonApp {
     fn device_list_or_fail_ui(
         &mut self,
         ctx: &egui::Context,
-    ) -> Option<Arc<RwLock<HashMap<String, DeviceInformation>>>> {
+    ) -> Option<Arc<RwLock<HashMap<String, DeviceInfo>>>> {
         let device_list = if let Some(s) = self.device_selector.as_ref() {
             s.list().clone()
         } else {
@@ -332,7 +331,7 @@ impl OwowonApp {
         Some(device_list)
     }
 
-    fn try_select_device(&mut self, device_id: impl Into<HSTRING>, ctx: &Context) {
+    fn try_select_device(&mut self, device_id: impl AsRef<str>, ctx: &Context) {
         match Device::blocking_from_device_id(device_id).map(|d| {
             DeviceRun::new(
                 d,

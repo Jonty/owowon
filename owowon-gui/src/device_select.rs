@@ -1,23 +1,14 @@
+use nusb::DeviceInfo;
 use owowon::device::{PID, VID};
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::RwLock;
-use windows::{
-    Devices::{
-        Enumeration::{DeviceInformation, DeviceInformationUpdate, DeviceWatcher},
-        Usb::UsbDevice,
-    },
-    Foundation::{EventRegistrationToken, TypedEventHandler},
-};
+use std::sync::RwLock;
+use std::{collections::HashMap, sync::Arc, thread};
 
-type DeviceList = Arc<RwLock<HashMap<String, DeviceInformation>>>;
+type DeviceList = Arc<RwLock<HashMap<String, DeviceInfo>>>;
 
 pub struct DeviceSelector {
     list: DeviceList,
-    watcher: DeviceWatcher,
-
-    added_token: EventRegistrationToken,
-    updated_token: EventRegistrationToken,
-    removed_token: EventRegistrationToken,
+    #[allow(dead_code)]
+    watch_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl DeviceSelector {
@@ -25,109 +16,63 @@ impl DeviceSelector {
         &self.list
     }
 
-    pub fn new(
-        update_ui: impl Fn() + Send + Clone + 'static,
-    ) -> Result<Self, windows::core::Error> {
+    pub fn new(update_ui: impl Fn() + Send + 'static) -> Result<Self, nusb::Error> {
         let list: DeviceList = Arc::new(RwLock::new(HashMap::new()));
 
-        let selector = UsbDevice::GetDeviceSelectorVidPidOnly(VID, PID)?;
-        let watcher = DeviceInformation::CreateWatcherAqsFilter(&selector)?;
+        // Initial enumeration - add all matching devices
+        for device in nusb::list_devices()? {
+            if device.vendor_id() == VID as u16 && device.product_id() == PID as u16 {
+                let id = device_id_string(&device);
+                list.write().unwrap().insert(id, device);
+            }
+        }
 
-        let list_added = list.clone();
-        let update_ui_clone = update_ui.clone();
-        let added_token = watcher.Added(&TypedEventHandler::new(move |a, b| {
-            Self::added(&list_added, a, b)?;
-            update_ui_clone();
-            Ok(())
-        }))?;
+        // Polling-based device monitoring in a background thread
+        let list_clone = list.clone();
+        let watch_thread = thread::spawn(move || {
+            loop {
+                thread::sleep(std::time::Duration::from_secs(1));
 
-        let list_updated = list.clone();
-        let update_ui_clone = update_ui.clone();
-        let updated_token = watcher.Updated(&TypedEventHandler::new(move |a, b| {
-            Self::updated(&list_updated, a, b)?;
-            update_ui_clone();
-            Ok(())
-        }))?;
+                // Get current device list
+                let Ok(current_devices) = nusb::list_devices() else {
+                    continue;
+                };
 
-        let list_removed = list.clone();
-        let update_ui_clone = update_ui;
-        let removed_token = watcher.Removed(&TypedEventHandler::new(move |a, b| {
-            Self::removed(&list_removed, a, b)?;
-            update_ui_clone();
-            Ok(())
-        }))?;
+                let mut new_list = HashMap::new();
+                for device in current_devices {
+                    if device.vendor_id() == VID as u16 && device.product_id() == PID as u16 {
+                        let id = device_id_string(&device);
+                        new_list.insert(id, device);
+                    }
+                }
 
-        watcher.Start()?;
+                // Check if the list changed
+                let mut list_guard = list_clone.write().unwrap();
+                if new_list.len() != list_guard.len()
+                    || !new_list.keys().all(|k| list_guard.contains_key(k))
+                {
+                    *list_guard = new_list;
+                    drop(list_guard);
+                    update_ui();
+                }
+            }
+        });
 
         Ok(Self {
             list,
-            watcher,
-            added_token,
-            updated_token,
-            removed_token,
+            watch_thread: Some(watch_thread),
         })
-    }
-
-    fn added(
-        list: &DeviceList,
-        _watcher: &Option<DeviceWatcher>,
-        info: &Option<DeviceInformation>,
-    ) -> Result<(), windows::core::Error> {
-        let info = if let Some(info) = info {
-            info
-        } else {
-            return Ok(());
-        };
-
-        let id = info.Id()?.to_string();
-        list.blocking_write().insert(id, info.clone());
-
-        Ok(())
-    }
-
-    fn updated(
-        list: &DeviceList,
-        _watcher: &Option<DeviceWatcher>,
-        info_update: &Option<DeviceInformationUpdate>,
-    ) -> Result<(), windows::core::Error> {
-        let info_update = if let Some(info_update) = info_update {
-            info_update
-        } else {
-            return Ok(());
-        };
-
-        let id = info_update.Id()?.to_string();
-
-        if let Some(info) = list.blocking_write().get_mut(&id) {
-            info.Update(info_update)?;
-        }
-
-        Ok(())
-    }
-
-    fn removed(
-        list: &DeviceList,
-        _watcher: &Option<DeviceWatcher>,
-        info_update: &Option<DeviceInformationUpdate>,
-    ) -> Result<(), windows::core::Error> {
-        let info_update = if let Some(info_update) = info_update {
-            info_update
-        } else {
-            return Ok(());
-        };
-
-        let id = info_update.Id()?.to_string();
-        list.blocking_write().remove(&id);
-
-        Ok(())
     }
 }
 
 impl Drop for DeviceSelector {
     fn drop(&mut self) {
-        let _ = self.watcher.Stop();
-        let _ = self.watcher.RemoveAdded(self.added_token);
-        let _ = self.watcher.RemoveUpdated(self.updated_token);
-        let _ = self.watcher.RemoveRemoved(self.removed_token);
+        // Thread will be terminated when the program exits
+        // We don't join it to avoid blocking on drop
     }
+}
+
+fn device_id_string(device: &DeviceInfo) -> String {
+    // Create stable identifier from bus/device
+    format!("{}:{}", device.bus_number(), device.device_address())
 }

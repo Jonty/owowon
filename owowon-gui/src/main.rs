@@ -1,14 +1,14 @@
 #![warn(clippy::all, rust_2018_idioms)]
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)] // hide console window on Windows in release
 
 mod app;
 mod device_run;
 mod device_select;
 mod optional_sender;
 mod selectable_label_full_width;
-
-#[global_allocator]
-static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let native_options = eframe::NativeOptions {

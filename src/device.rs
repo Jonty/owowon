@@ -8,7 +8,8 @@ use crate::{
     OscilloscopeMessage, OscilloscopeRunCommand, OscilloscopeRunSetting, SignalData,
 };
 use arrayvec::ArrayVec;
-use snafu::{ensure, Location, OptionExt, ResultExt, Snafu};
+use nusb::{transfer::RequestBuffer, DeviceInfo, Interface};
+use snafu::{ensure, Location, ResultExt, Snafu};
 use std::{
     io::Write,
     str::{from_utf8, Utf8Error},
@@ -17,14 +18,6 @@ use std::{
 use tokio::{
     sync::mpsc::{self, error::TryRecvError},
     time::{error::Elapsed, timeout, Instant},
-};
-use windows::{
-    core::HSTRING,
-    Devices::{
-        Enumeration::DeviceInformation,
-        Usb::{UsbBulkInPipe, UsbBulkOutPipe, UsbDevice, UsbInterface, UsbWriteOptions},
-    },
-    Storage::Streams::{DataReader, DataWriter},
 };
 
 pub const VID: u32 = 0x5345;
@@ -40,20 +33,21 @@ pub enum FromUsbDeviceError {
         pid: u32,
     },
     #[snafu(context(false))]
-    Windows {
-        source: WindowsError,
+    Usb {
+        source: UsbError,
     },
     #[snafu(context(false))]
     DeviceInitialization {
         source: DeviceInitializationError,
     },
+    NoDeviceFound,
 }
 
-impl From<windows::core::Error> for FromUsbDeviceError {
+impl From<nusb::Error> for FromUsbDeviceError {
     #[track_caller]
-    fn from(source: windows::core::Error) -> Self {
-        FromUsbDeviceError::Windows {
-            source: WindowsError::from(source),
+    fn from(source: nusb::Error) -> Self {
+        FromUsbDeviceError::Usb {
+            source: UsbError::from(source),
         }
     }
 }
@@ -61,126 +55,128 @@ impl From<windows::core::Error> for FromUsbDeviceError {
 #[derive(Debug, Snafu)]
 pub enum DeviceInitializationError {
     #[snafu(context(false))]
-    Windows {
-        source: WindowsError,
+    Usb {
+        source: UsbError,
     },
     BulkInPipeNotFound,
     BulkOutPipeNotFound,
 }
 
-impl From<windows::core::Error> for DeviceInitializationError {
+impl From<nusb::Error> for DeviceInitializationError {
     #[track_caller]
-    fn from(source: windows::core::Error) -> Self {
-        DeviceInitializationError::Windows {
-            source: WindowsError::from(source),
+    fn from(source: nusb::Error) -> Self {
+        DeviceInitializationError::Usb {
+            source: UsbError::from(source),
         }
     }
 }
 
 #[derive(Debug, Snafu)]
 #[snafu(context(false))]
-pub struct WindowsError {
+pub struct UsbError {
     #[snafu(implicit)]
     location: Location,
-    source: windows::core::Error,
+    source: nusb::Error,
 }
 
 #[allow(dead_code)]
 pub struct Device {
-    device: UsbDevice,
-    interface: UsbInterface,
-    bulk_in: UsbBulkInPipe,
-    bulk_out: UsbBulkOutPipe,
+    device: nusb::Device,
+    interface: Interface,
+    bulk_in_ep: u8,  // 0x81
+    bulk_out_ep: u8, // 0x01
 }
 
 impl Device {
     pub async fn from_first_vid_pid_match() -> Result<Self, FromUsbDeviceError> {
-        let selector = UsbDevice::GetDeviceSelectorVidPidOnly(VID, PID)?;
+        let device_info = nusb::list_devices()?
+            .find(|d| d.vendor_id() == VID as u16 && d.product_id() == PID as u16)
+            .ok_or(FromUsbDeviceError::NoDeviceFound)?;
 
-        let device = DeviceInformation::FindAllAsyncAqsFilter(&selector)?
-            .await?
-            .into_iter()
-            .next()
-            .expect("no device found");
-
-        let device = UsbDevice::FromIdAsync(&device.Id()?)?.await?;
-
-        Self::from_usb_device(device)
+        Self::from_device_info(device_info).await
     }
 
-    pub async fn from_device_id(device_id: impl Into<HSTRING>) -> Result<Self, FromUsbDeviceError> {
-        let device = UsbDevice::FromIdAsync(&device_id.into())?.await?;
+    pub async fn from_device_id(device_id: impl AsRef<str>) -> Result<Self, FromUsbDeviceError> {
+        let device_id = device_id.as_ref();
 
-        Self::from_usb_device(device)
+        // Device ID format: "bus:address" - match by ID AND VID/PID
+        let device_info = nusb::list_devices()?
+            .find(|d| {
+                let id = format!("{}:{}", d.bus_number(), d.device_address());
+                id == device_id && d.vendor_id() == VID as u16 && d.product_id() == PID as u16
+            })
+            .ok_or(FromUsbDeviceError::NoDeviceFound)?;
+
+        Self::from_device_info(device_info).await
     }
 
-    pub fn blocking_from_device_id(
-        device_id: impl Into<HSTRING>,
-    ) -> Result<Self, FromUsbDeviceError> {
-        let device = UsbDevice::FromIdAsync(&device_id.into())?.get()?;
+    pub fn blocking_from_device_id(device_id: impl AsRef<str>) -> Result<Self, FromUsbDeviceError> {
+        let device_id = device_id.as_ref();
 
-        Self::from_usb_device(device)
+        let device_info = nusb::list_devices()?
+            .find(|d| {
+                let id = format!("{}:{}", d.bus_number(), d.device_address());
+                id == device_id && d.vendor_id() == VID as u16 && d.product_id() == PID as u16
+            })
+            .ok_or(FromUsbDeviceError::NoDeviceFound)?;
+
+        Self::blocking_from_device_info(device_info)
     }
 
-    pub fn from_usb_device(device: UsbDevice) -> Result<Self, FromUsbDeviceError> {
-        let descriptor = device.DeviceDescriptor()?;
-        let vid = descriptor.VendorId()?;
-        let pid = descriptor.ProductId()?;
+    pub async fn from_device_info(device_info: DeviceInfo) -> Result<Self, FromUsbDeviceError> {
+        let vid = device_info.vendor_id() as u32;
+        let pid = device_info.product_id() as u32;
 
         ensure!(vid == VID && pid == PID, WrongVidPidSnafu { vid, pid });
 
-        Ok(Self::initialize_device(device)?)
+        let device = device_info.open()?;
+        let interface = device.claim_interface(0)?;
+
+        Ok(Self::initialize_device(device, interface)?)
     }
 
-    fn initialize_device(device: UsbDevice) -> Result<Self, DeviceInitializationError> {
-        let interface = device.DefaultInterface()?;
+    pub fn blocking_from_device_info(device_info: DeviceInfo) -> Result<Self, FromUsbDeviceError> {
+        let vid = device_info.vendor_id() as u32;
+        let pid = device_info.product_id() as u32;
 
-        let bulk_in = interface
-            .BulkInPipes()?
-            .into_iter()
-            .find(|p| {
-                matches!(
-                    p.EndpointDescriptor().and_then(|ed| ed.EndpointNumber()),
-                    Ok(1)
-                )
-            })
-            .context(BulkInPipeNotFoundSnafu)?;
+        ensure!(vid == VID && pid == PID, WrongVidPidSnafu { vid, pid });
 
-        let bulk_out = interface
-            .BulkOutPipes()?
-            .into_iter()
-            .find(|p| {
-                matches!(
-                    p.EndpointDescriptor().and_then(|ed| ed.EndpointNumber()),
-                    Ok(1)
-                )
-            })
-            .context(BulkOutPipeNotFoundSnafu)?;
+        let device = device_info.open()?;
+        let interface = device.claim_interface(0)?;
 
-        bulk_out.SetWriteOptions(UsbWriteOptions::AutoClearStall)?;
+        Ok(Self::initialize_device(device, interface)?)
+    }
+
+    fn initialize_device(
+        device: nusb::Device,
+        interface: Interface,
+    ) -> Result<Self, DeviceInitializationError> {
+        // Assuming endpoint 1 IN (0x81) and OUT (0x01) based on the original code
+        let bulk_in_ep = 0x81;
+        let bulk_out_ep = 0x01;
 
         Ok(Self {
             device,
             interface,
-            bulk_in,
-            bulk_out,
+            bulk_in_ep,
+            bulk_out_ep,
         })
     }
 
-    pub fn raw_io(&self) -> Result<Io, WindowsError> {
-        let input = self.bulk_in.InputStream()?;
-        let output = self.bulk_out.OutputStream()?;
+    pub fn raw_io(&self) -> Result<Io, UsbError> {
         Ok(Io {
-            r: DataReader::CreateDataReader(&input)?,
-            w: DataWriter::CreateDataWriter(&output)?,
+            interface: self.interface.clone(),
+            bulk_in_ep: self.bulk_in_ep,
+            bulk_out_ep: self.bulk_out_ep,
             last_write: Instant::now(),
         })
     }
 }
 
 pub struct Io {
-    r: DataReader,
-    w: DataWriter,
+    interface: Interface,
+    bulk_in_ep: u8,
+    bulk_out_ep: u8,
     last_write: Instant,
 }
 
@@ -197,9 +193,9 @@ impl Io {
         self.raw_send_nowait(command).await
     }
 
-    pub async fn send_with_writer<'a>(
-        &'a mut self,
-        f: impl FnOnce(&mut IoWriter<'a>) -> Result<(), std::io::Error>,
+    pub async fn send_with_writer(
+        &mut self,
+        f: impl FnOnce(&mut IoWriter) -> Result<(), std::io::Error>,
     ) -> Result<(), IoError> {
         timeout(IO_TIMEOUT, self.raw_send_with_writer(f)).await?
     }
@@ -218,31 +214,34 @@ impl Io {
     }
 
     pub async fn raw_recv<'a>(&mut self, buf: &'a mut [u8]) -> Result<&'a mut [u8], IoError> {
-        assert!(buf.len() <= u32::MAX as usize);
+        let completion = self
+            .interface
+            .bulk_in(self.bulk_in_ep, RequestBuffer::new(buf.len()))
+            .await;
+        let data = completion.data;
+        let bytes_read = data.len();
 
-        let bytes_read = self.r.LoadAsync(buf.len() as u32)?.await?;
-        let buf_len = buf.len();
+        buf[..bytes_read].copy_from_slice(&data);
 
-        let sliced_buf = &mut buf[..buf_len.min(bytes_read as usize)];
-        self.r.ReadBytes(sliced_buf)?;
-
-        Ok(sliced_buf)
+        Ok(&mut buf[..bytes_read])
     }
 
     pub async fn raw_send_nowait(&mut self, command: &[u8]) -> Result<(), IoError> {
-        self.w.WriteBytes(command)?;
-
         self.last_write = Instant::now();
-        self.w.StoreAsync()?.await?;
+        let completion = self
+            .interface
+            .bulk_out(self.bulk_out_ep, command.to_vec())
+            .await;
+        completion.status.map_err(nusb::Error::from)?;
 
         Ok(())
     }
 
-    pub async fn raw_send_with_writer<'a>(
-        &'a mut self,
-        f: impl FnOnce(&mut IoWriter<'a>) -> Result<(), std::io::Error>,
+    pub async fn raw_send_with_writer(
+        &mut self,
+        f: impl FnOnce(&mut IoWriter) -> Result<(), std::io::Error>,
     ) -> Result<(), IoError> {
-        let mut io_writer = IoWriter(&self.w);
+        let mut io_writer = IoWriter(Vec::new());
         f(&mut io_writer)?;
 
         if let Some(wait) = MIN_PAUSE.checked_sub(self.last_write.elapsed()) {
@@ -250,39 +249,29 @@ impl Io {
         }
 
         self.last_write = Instant::now();
-        self.w.StoreAsync()?.await?;
+        let completion = self.interface.bulk_out(self.bulk_out_ep, io_writer.0).await;
+        completion.status.map_err(nusb::Error::from)?;
 
         Ok(())
     }
 }
 
-pub struct IoWriter<'a>(&'a DataWriter);
+pub struct IoWriter(Vec<u8>);
 
 #[derive(Debug, Snafu)]
 pub enum IoError {
     #[snafu(transparent)]
-    Windows { source: WindowsError },
+    Usb { source: UsbError },
     #[snafu(context(false))]
     Io { source: std::io::Error },
     #[snafu(context(false))]
     Timeout { source: Elapsed },
 }
 
-impl From<windows::core::Error> for IoError {
-    #[track_caller]
-    fn from(source: windows::core::Error) -> Self {
-        IoError::Windows {
-            source: WindowsError::from(source),
-        }
-    }
-}
-
-impl<'a> Write for IoWriter<'a> {
+impl Write for IoWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .WriteBytes(buf)
-            .map(|_| buf.len())
-            .map_err(|e| std::io::Error::from_raw_os_error(e.code().0))
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -683,7 +672,7 @@ async fn get_measurements(
 #[derive(Debug, Snafu)]
 pub enum RunError {
     IoOpen {
-        source: WindowsError,
+        source: UsbError,
     },
     #[snafu(context(false))]
     SendCommand {

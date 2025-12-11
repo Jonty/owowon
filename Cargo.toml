@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 tokio = { version = "1.37" }
-windows = { version = "0.56.0" }
+nusb = "0.1"
 snafu = "0.8.2"
 serde = "1"
 
@@ -21,12 +21,7 @@ license.workspace = true
 
 [dependencies]
 tokio = { workspace = true, features = ["macros", "sync", "time"] }
-windows = { workspace = true, features = [
-  "Devices_Enumeration",
-  "Devices_Usb",
-  "Foundation_Collections",
-  "Storage_Streams",
-] }
+nusb = { workspace = true }
 snafu = { workspace = true }
 strum = { version = "0.26", features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }

@@ -1,0 +1,9 @@
+# Owon HDS Series Oscilloscopes - allow non-root access
+# VID=0x5345, PID=0x1234
+#
+# Installation:
+#   sudo cp 50-owon-hds.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Unplug and replug the device, or reboot
+SUBSYSTEM=="usb", ATTRS{idVendor}=="5345", ATTRS{idProduct}=="1234", MODE="0666"
